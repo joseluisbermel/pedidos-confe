@@ -4,6 +4,8 @@ import streamlit as st
 from pypdf import PdfReader
 import openpyxl
 from openpyxl.styles import PatternFill
+from PIL import Image
+import pdf2image
 
 st.set_page_config(
     page_title="Gestor de Pedidos Escolares",
@@ -14,43 +16,95 @@ st.set_page_config(
 # Estilo de alerta en amarillo chillón para celdas dudosas o anomalías
 YELLOW_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
-def extraer_datos_pdf(pdf_bytes):
+def extraer_texto_pagina(page, pdf_bytes, page_idx):
     """
-    Lee cada página del PDF, extrae los datos del alumno, busca las referencias 
-    exactas y frena de golpe al encontrar 'TOTAL ARTÍCULOS'.
+    Intenta extraer texto de forma digital. Si está vacío (es una imagen escaneada),
+    aplica OCR localmente mediante pytesseract y pdf2image.
+    """
+    texto = page.extract_text() or ""
+    if len(texto.strip()) > 15:
+        return texto
+    
+    # Fallback a OCR si la página es una imagen escaneada
+    try:
+        import pytesseract
+        images = pdf2image.convert_from_bytes(pdf_bytes, first_page=page_idx+1, last_page=page_idx+1)
+        if images:
+            texto_ocr = pytesseract.image_to_string(images[0], lang='spa')
+            return texto_ocr
+    except Exception as e:
+        print(f"Error en OCR para página {page_idx+1}: {e}")
+        
+    return texto
+
+
+def extraer_pedidos_agrupados(pdf_bytes):
+    """
+    Agrupa las páginas del PDF por alumno de forma inteligente.
+    Una ficha puede ocupar 1 o 2 páginas y finaliza al encontrar 'TOTAL ARTÍCULOS'.
     """
     reader = PdfReader(io.BytesIO(pdf_bytes))
     pedidos = []
     
+    alumno_actual = None
+    
     for idx, page in enumerate(reader.pages):
-        texto = page.extract_text() or ""
+        texto = extraer_texto_pagina(page, pdf_bytes, idx)
+        lineas = [l.strip() for l in texto.split("\n") if l.strip()]
         
-        # 1. Extraer Nombre y Apellidos de forma robusta
-        match_nombre = re.search(r"NOMBRE Y APELLIDOS:\s*(.*?)(?=\s*TELÉFONO|\s*CURSO|\n|$)", texto, re.IGNORECASE)
-        nombre = match_nombre.group(1).strip() if match_nombre else ""
-        
-        if not nombre or len(nombre) < 3:
-            lineas_texto = texto.split("\n")
-            for l_idx, linea in enumerate(lineas_texto):
-                if "NOMBRE Y APELLIDOS" in linea.upper():
-                    if l_idx + 1 < len(lineas_texto):
-                        nombre = linea.split(":")[-1].strip() + " " + lineas_texto[l_idx + 1].strip()
+        # Si no hay un alumno activo, buscamos los datos de cabecera en esta página
+        if alumno_actual is None:
+            nombre = ""
+            telefono = ""
+            curso = ""
+            
+            # Buscar nombre
+            for l_idx, linea in enumerate(lineas):
+                if "NOMBRE" in linea.upper() or "APELLIDOS" in linea.upper():
+                    if ":" in linea:
+                        nombre = linea.split(":")[-1].strip()
+                    if not nombre and l_idx + 1 < len(lineas):
+                        nombre = lineas[l_idx + 1].strip()
+                    break
+            
+            # Si no se encontró por etiqueta, buscamos patrones habituales
+            if not nombre or len(nombre) < 3:
+                for linea in lineas:
+                    if len(linea) > 5 and not "EMORENO" in linea.upper() and not "PEDIDOS" in linea.upper() and not "ESCOLAR" in linea.upper():
+                        # Podría ser el nombre si va en mayúsculas
+                        if linea == linea.upper() and " " in linea:
+                            nombre = linea
+                            break
+
+            nombre = re.sub(r"TELÉFONO.*", "", nombre, flags=re.IGNORECASE).strip()
+            nombre = re.sub(r"CURSO.*", "", nombre, flags=re.IGNORECASE).strip()
+
+            # Buscar teléfono
+            for linea in lineas:
+                match_tel = re.search(r"(?:TELÉFONO|TELEFONO|TELF)[:\s]*([\d\s]{6,15})", linea, re.IGNORECASE)
+                if match_tel:
+                    telefono = match_tel.group(1).strip()
                     break
 
-        nombre = re.sub(r"TELÉFONO.*", "", nombre, flags=re.IGNORECASE).strip()
-        
-        # 2. Extraer Teléfono y Curso
-        match_tel = re.search(r"TELÉFONO:\s*([\d\s]{6,15})", texto, re.IGNORECASE)
-        telefono = match_tel.group(1).strip() if match_tel else ""
-        
-        match_curso = re.search(r"CURSO/CENTRO:\s*(.*?)(?=\s*FECHA|\n|$)", texto, re.IGNORECASE)
-        curso = match_curso.group(1).strip() if match_curso else ""
-        
-        # 3. Extracción tabulada estricta de referencias hasta "TOTAL ARTÍCULOS"
-        cantidades = {}
-        lineas = texto.split("\n")
+            # Buscar curso / centro
+            for linea in lineas:
+                match_cur = re.search(r"(?:CURSO/CENTRO|CURSO|CENTRO)[:\s]*(.*)", linea, re.IGNORECASE)
+                if match_cur:
+                    curso = match_cur.group(1).strip()
+                    break
+
+            alumno_actual = {
+                "nombre": nombre if nombre else f"ALUMNO_PAG_{idx + 1}",
+                "telefono": telefono,
+                "curso": curso,
+                "cantidades": {},
+                "paginas": [idx + 1]
+            }
+        else:
+            alumno_actual["paginas"].append(idx + 1)
+
+        # Extracción de referencias (C001 a C030) y cantidades
         leyendo_tabla = True
-        
         for linea in lineas:
             if "TOTAL" in linea.upper() and "ARTÍCULO" in linea.upper():
                 leyendo_tabla = False
@@ -60,44 +114,39 @@ def extraer_datos_pdf(pdf_bytes):
                 match_ref = re.search(r"\b(C\d{3})\b", linea)
                 if match_ref:
                     ref_code = match_ref.group(1)
-                    
-                    # FILTRO INTELIGENTE: Ignorar números que sean gramos (300g, 1800g, etc.) o la referencia
-                    # Buscamos números en la línea que sean candidatos lógicos de cantidad (ej: entre 1 y 50)
                     numeros = re.findall(r"\b\d+\b", linea)
                     candidatos = []
                     for n in numeros:
                         val = int(n)
-                        # Descartar el número de referencia y números grandes (que son gramos o precios)
+                        # Descartar número de referencia y gramos (300g, 1800g, etc.)
                         if val != int(ref_code[1:]) and val <= 50:
-                            # Asegurarnos de que no van acompañados de 'g' o 'gr' inmediatamente
-                            patron_gramos = rf"{val}\s*(?:g|gr|kg)"
-                            if not re.search(patron_gramos, linea, re.IGNORECASE):
+                            if not re.search(rf"{val}\s*(?:g|gr|kg)", linea, re.IGNORECASE):
                                 candidatos.append(val)
-                    
                     if candidatos:
-                        # La cantidad real suele ser el último número válido de la línea
-                        cantidades[ref_code] = candidatos[-1]
+                        alumno_actual["cantidades"][ref_code] = candidatos[-1]
 
-        pedidos.append({
-            "pagina": idx + 1,
-            "nombre": nombre if nombre else f"ALUMNO_PAG_{idx + 1}",
-            "telefono": telefono,
-            "curso": curso,
-            "cantidades": cantidades
-        })
+        # Comprobar si esta página contiene el cierre del pedido ("TOTAL ARTÍCULOS")
+        es_fin_pedido = any("TOTAL" in l.upper() and "ARTÍCULO" in l.upper() for l in lineas)
+        if es_fin_pedido:
+            pedidos.append(alumno_actual)
+            alumno_actual = None
+
+    # Si queda un alumno pendiente sin cierre explícito, se guarda
+    if alumno_actual is not None:
+        pedidos.append(alumno_actual)
         
     return pedidos
 
 
 def rellenar_excel_dinamico(excel_bytes, pedidos):
     """
-    Rellena la plantilla Excel buscando dinámicamente dónde van los datos 
-    y duplicando pestañas si hay más alumnos que hojas en la plantilla original.
+    Rellena la plantilla Excel con los pedidos agrupados, duplicando pestañas 
+    automáticamente si hay más alumnos que hojas en la plantilla original.
     """
     wb = openpyxl.load_workbook(io.BytesIO(excel_bytes))
     hojas_disponibles = wb.sheetnames
     
-    # Identificar hojas de alumnos (excluyendo RESUMEN, etc.)
+    # Excluir pestañas de sistema o resumen
     hojas_alumnos_base = [h for h in hojas_disponibles if h.upper() not in ["RESUMEN", "INSTRUCCIONES", "DATOS", "TARIFA"]]
     
     if not hojas_alumnos_base:
@@ -109,48 +158,33 @@ def rellenar_excel_dinamico(excel_bytes, pedidos):
     alertas = []
 
     for i, pedido in enumerate(pedidos):
-        # Si hay más alumnos en el PDF que pestañas en el Excel, duplicamos la plantilla
+        # Asignar o duplicar pestaña para el alumno actual
         if i < len(hojas_alumnos_base):
             ws = wb[hojas_alumnos_base[i]]
         else:
-            # Duplicar hoja plantilla para el nuevo alumno
             ws = wb.copy_worksheet(ws_plantilla)
-            nombre_nueva_hoja = f"Alumno_{i+1}"
-            ws.title = nombre_nueva_hoja
+            ws.title = f"Alumno_{i+1}"
 
-        # --- BÚSQUEDA DINÁMICA DE CABECERA EN EL EXCEL ---
-        # Buscamos dónde pone "NOMBRE" o "NOMBRE DEL ALUMNO" para colocar el nombre al lado
+        # --- VOLCADO DINÁMICO DE CABECERA ---
         celda_nombre_encontrada = False
-        celda_telefono_encontrada = False
-        
-        for row in range(1, 15): # Buscar en las primeras 15 filas
+        for row in range(1, 15):
             for col in range(1, 10):
                 val = str(ws.cell(row=row, column=col).value or "").upper()
                 
-                # Buscar celda del nombre
                 if "NOMBRE" in val and not celda_nombre_encontrada:
-                    celda_val = ws.cell(row=row, column=col + 1) # Celda a la derecha
-                    if "ALUMNO" in val or ws.cell(row=row, column=col).value == "NOMBRE DEL ALUMNO:":
-                        # A veces está debajo o a la derecha, probamos a la derecha o en col+2
-                        celda_destino = ws.cell(row=row, column=col + 1)
-                    else:
-                        celda_destino = ws.cell(row=row, column=col + 1)
-                    
-                    if "ALUMNO_PAG" in pedido["nombre"]:
+                    celda_destino = ws.cell(row=row, column=col + 1)
+                    if "ALUMNO_PAG" in pedido["nombre"] or not pedido["nombre"]:
                         celda_destino.value = "¡REVISAR NOMBRE!"
                         celda_destino.fill = YELLOW_FILL
-                        alertas.append(f"Página {pedido['pagina']}: Nombre no detectado.")
+                        alertas.append(f"Páginas {pedido['paginas']}: Nombre no detectado.")
                     else:
                         celda_destino.value = pedido["nombre"]
                     celda_nombre_encontrada = True
 
-                # Buscar celda del teléfono
                 if "TELÉFONO" in val or "TELEFONO" in val:
                     if pedido["telefono"]:
                         ws.cell(row=row, column=col + 1, value=pedido["telefono"])
-                    celda_telefono_encontrada = True
 
-        # Fallback por si la etiqueta no se encuentra exactamente
         if not celda_nombre_encontrada:
             ws["B10"] = pedido["nombre"] if "ALUMNO_PAG" not in pedido["nombre"] else "¡REVISAR NOMBRE!"
 
@@ -162,7 +196,6 @@ def rellenar_excel_dinamico(excel_bytes, pedidos):
                 match_c = re.search(r"\b(C\d{3})\b", val)
                 if match_c:
                     ref_code = match_c.group(1)
-                    # La cantidad suele estar unas columnas a la derecha de la referencia
                     mapa_celdas_ref[ref_code] = (row, col + 3)
 
         # --- VOLCADO Y VALIDACIÓN DE CANTIDADES ---
@@ -174,7 +207,7 @@ def rellenar_excel_dinamico(excel_bytes, pedidos):
                 if cantidad > 50:
                     celda_destino.value = cantidad
                     celda_destino.fill = YELLOW_FILL
-                    alertas.append(f"Página {pedido['pagina']} ({pedido['nombre']}): Cantidad anómala ({cantidad}) en {ref_code}.")
+                    alertas.append(f"Alumno {pedido['nombre']} (Págs {pedido['paginas']}): Cantidad anómala ({cantidad}) en {ref_code}.")
                 else:
                     celda_destino.value = cantidad
 
@@ -186,7 +219,7 @@ def rellenar_excel_dinamico(excel_bytes, pedidos):
 
 # --- INTERFAZ GRÁFICA STREAMLIT ---
 st.title("🍬 Procesador de Pedidos de Confitura")
-st.markdown("Extracción inteligente con búsqueda dinámica de campos y filtro de pesos.")
+st.markdown("Agrupación inteligente multi-página y soporte OCR para hojas escritas a mano.")
 
 st.sidebar.header("Configuración")
 nombre_colegio = st.sidebar.text_input("Nombre del Colegio / Centro", placeholder="Ej: IES_Lopez_de_Arenas")
@@ -204,18 +237,19 @@ with col2:
 
 st.divider()
 
-if st.button("🚀 Procesar con Precisión Quirúrgica", type="primary", use_container_width=True):
+if st.button("🚀 Procesar Pedidos al Completo", type="primary", use_container_width=True):
     if not nombre_colegio:
         st.error("❌ Introduce el nombre del colegio.")
     elif not pdf_file or not excel_file:
         st.error("❌ Sube ambos archivos.")
     else:
-        with st.spinner("Analizando páginas, filtrando gramos y rellenando pestañas..."):
+        with st.spinner("Agrupando páginas, aplicando OCR y volcando en el Excel..."):
             try:
-                pedidos = extraer_datos_pdf(pdf_file.read())
+                pdf_bytes = pdf_file.read()
+                pedidos = extraer_pedidos_agrupados(pdf_bytes)
                 excel_procesado, alertas = rellenar_excel_dinamico(excel_file.read(), pedidos)
                 
-                st.success(f"✅ ¡Lectura finalizada! Se han procesado {len(pedidos)} fichas de alumnos.")
+                st.success(f"✅ ¡Proceso completado! Se han consolidado {len(pedidos)} fichas de alumnos.")
                 
                 if alertas:
                     with st.expander("⚠️ Alertas de revisión:", expanded=True):
