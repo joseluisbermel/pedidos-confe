@@ -13,94 +13,101 @@ st.set_page_config(
     page_title="Gestor de Pedidos Escolares", page_icon="🍬", layout="wide"
 )
 
-# Estilo de alerta en amarillo chillón para celdas dudosas
 YELLOW_FILL = PatternFill(
     start_color="FFFF00", end_color="FFFF00", fill_type="solid"
 )
 
-
 def segmentar_y_leer_cantidades(pil_image):
     """
-    Usa OpenCV para localizar la tabla, aislar la columna de cantidades,
-    y extraer los números fila por fila de forma geométrica estructurada.
+    Rastrea las celdas físicas de la columna de cantidades mediante contornos,
+    corrigiendo desviaciones de escala de forma geométrica exacta.
     """
-    # Convertir imagen PIL a formato OpenCV (Grises)
+    # Forzar un reescalado estándar para unificar la resolución del OCR
     img = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+    img = cv2.resize(img, (1654, 2339)) # Resolución estándar A4 a 200 DPI
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Binarizar la imagen para encontrar las líneas negras
-    _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+    # Binarizar adaptativamente para compensar sombras de fotos de móviles
+    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
     
-    # Aislar las líneas horizontales y verticales
-    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+    # Aislar estructuras de la tabla
+    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (50, 1))
     lineas_h = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_h)
     
-    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 50))
     lineas_v = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_v)
     
-    # Encontrar la cuadrícula de la tabla
-    tabla_lineas = cv2.add(lineas_h, lineas_v)
-    contornos, _ = cv2.findContours(tabla_lineas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cuadricula = cv2.add(lineas_h, lineas_v)
     
+    # Encontrar contornos de celdas individuales individuales
+    contornos, _ = cv2.findContours(cuadricula, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    
+    celdas_cantidad = []
+    for c in contornos:
+        x, y, w, h = cv2.boundingRect(c)
+        # Filtrar por proporciones típicas de la celda de cantidad en formato A4 escalado
+        if 40 < w < 180 and 30 < h < 70:
+            celdas_cantidad.append((x, y, w, h))
+            
     cantidades_detectadas = {}
-    if not contornos:
-        return cantidades_detectadas
-
-    # Obtener el recuadro de la tabla principal
-    tabla_macro = max(contornos, key=cv2.contourArea)
-    x, y, w, h = cv2.boundingRect(tabla_macro)
+    if len(celdas_cantidad) < 10:
+        return cantidades_detectadas # Si no encuentra suficientes celdas estructuradas, aborta para evitar basura
+        
+    # Ordenar las celdas detectadas de arriba a abajo usando su coordenada Y
+    celdas_cantidad = sorted(celdas_cantidad, key=lambda b: b[1])
     
-    # La columna cantidad está en el último 15% del ancho de la tabla
-    x_cant = x + int(w * 0.85)
-    w_cant = int(w * 0.15)
+    # Quedarse con las celdas que estén más a la derecha (columna de cantidades)
+    x_max = max([c[0] for c in celdas_cantidad])
+    celdas_columna_derecha = [c for c in celdas_cantidad if abs(c[0] - x_max) < 50]
     
-    # Dividir el bloque vertical simétricamente en 30 filas (C001 a C030)
-    alto_fila = h / 30.0
+    # Re-ordenar verticalmente la columna filtrada
+    celdas_columna_derecha = sorted(celdas_columna_derecha, key=lambda b: b[1])
     
     import pytesseract
-    for i in range(30):
-        y_fila_inicio = y + int(i * alto_fila)
-        y_fila_fin = y + int((i + 1) * alto_fila)
+    # Mapear las celdas encontradas contra el catálogo C001-C030 de forma secuencial
+    for idx, (x, y, w, h) in enumerate(celdas_columna_derecha[:30]):
+        # Extraer la celda con un pequeño margen interno para evitar bordes negros de la tabla
+        margen = 4
+        sub_celda = gray[y+margen:y+h-margen, x+margen:x+w-margen]
         
-        # Recortar la celda exacta de cantidad para el artículo actual
-        celda = gray[y_fila_inicio:y_fila_fin, x_cant:x_cant+w_cant]
-        
-        # Pasar un OCR optimizado exclusivamente para dígitos en una celda pequeña
+        # OCR con configuración estricta para dígitos individuales sueltos
         texto_celda = pytesseract.image_to_string(
-            celda, config='--psm 10 --oem 3 -c tessedit_char_whitelist=0123456789'
+            sub_celda, config='--psm 10 --oem 3 -c tessedit_char_whitelist=0123456789'
         ).strip()
         
-        ref_code = f"C{i+1:03d}"
+        ref_code = f"C{idx+1:03d}"
         if texto_celda.isdigit():
             val = int(texto_celda)
-            if val > 0 and val < 50:  # Descartar ruidos o manchas que den números absurdos
+            if 0 < val < 50:
                 cantidades_detectadas[ref_code] = val
                 
     return cantidades_detectadas
 
 
 def extraer_texto_pagina(page, pdf_bytes, page_idx):
-  """Extrae texto digital o aplica OCR completo de la página si es necesario."""
+  """Extrae texto digital nativo u obliga un renderizado uniforme a 200 DPI para fotos."""
   texto = page.extract_text() or ""
   if len(texto.strip()) > 40:
     return texto, None
 
   try:
-    import pytesseract
+    import pdf2image
+    # Definimos 200 DPI de forma explícita para estabilizar el tamaño de la matriz en OpenCV
     images = pdf2image.convert_from_bytes(
-        pdf_bytes, first_page=page_idx + 1, last_page=page_idx + 1
+        pdf_bytes, dpi=200, first_page=page_idx + 1, last_page=page_idx + 1
     )
     if images:
+      import pytesseract
       texto_ocr = pytesseract.image_to_string(images[0], lang="spa")
       return texto_ocr, images[0]
   except Exception as e:
-    st.warning(f"Aviso en página {page_idx+1}: {e}")
+    st.warning(f"Aviso en procesamiento de imagen de página {page_idx+1}: {e}")
 
   return texto, None
 
 
 def extraer_pedidos_agrupados(pdf_bytes):
-  """Procesa el PDF unificando cabeceras y aplicando segmentación visual."""
+  """Procesa el PDF unificando cabeceras y aplicando segmentación de celdas físicas."""
   reader = PdfReader(io.BytesIO(pdf_bytes))
   pedidos = []
   alumno_actual = None
@@ -111,7 +118,7 @@ def extraer_pedidos_agrupados(pdf_bytes):
 
     contiene_nombre = any(
         x in texto.upper()
-        for x in ["NOMBRE Y APELLIDOS:", "HOJA DE PEDIDOS"]
+        for x in ["NOMBRE Y APELLIDOS:", "HOJA DE PEDIDOS", "PROMO"]
     )
 
     if alumno_actual is None or contiene_nombre:
@@ -147,13 +154,10 @@ def extraer_pedidos_agrupados(pdf_bytes):
     else:
       alumno_actual["paginas"].append(idx + 1)
 
-    # --- EXTRACCIÓN DE CANTIDADES ---
     if pil_image is not None:
-        # Si es una foto/imagen, usamos el motor geométrico de OpenCV por celdas aisladas
         cantidades_img = segmentar_y_leer_cantidades(pil_image)
         alumno_actual["cantidades"].update(cantidades_img)
     else:
-        # Si es texto digital nativo, aplicamos el procesado por línea seguro
         for linea in lineas:
           match_ref = re.search(r"\b(C\d{3})\b", linea)
           if match_ref:
@@ -209,7 +213,7 @@ def rellenar_excel_dinamico(excel_bytes, pedidos):
           if "REVISAR" in pedido["nombre"]:
             celda_destino.value = f"REVISAR (Pág {pedido['paginas']})"
             celda_destino.fill = YELLOW_FILL
-            alertas.append(f"⚠️ Páginas {pedido['paginas']}: No se pudo leer el nombre manuscrito.")
+            alertas.append(f"⚠️ Páginas {pedido['paginas']}: No se pudo leer el nombre.")
           else:
             celda_destino.value = pedido["nombre"]
           celda_nombre_encontrada = True
@@ -236,7 +240,7 @@ def rellenar_excel_dinamico(excel_bytes, pedidos):
 
 # --- INTERFAZ DE USUARIO (STREAMLIT WEB) ---
 st.title("🍬 Gestor Automatizado de Pedidos - E. Moreno")
-st.markdown("Carga tu PDF desordenado y tu plantilla Excel. El sistema aislará visualmente las columnas de cantidades.")
+st.markdown("Carga tu PDF desordenado y tu plantilla Excel. Detección por contornos geométricos de celdas físicas.")
 
 st.sidebar.header("Opciones del Informe")
 nombre_colegio = st.sidebar.text_input("Centro Escolar", value="IES_Lopez_de_Arenas")
@@ -254,20 +258,16 @@ if st.button("🚀 Ejecutar Consolidación de Pedidos", type="primary", use_cont
   if not pdf_file or not excel_file:
     st.error("❌ Por favor, sube ambos archivos antes de ejecutar el proceso.")
   else:
-    with st.spinner("Procesando celdas y alineando datos en segundo plano..."):
-        try:
-            pdf_bytes = pdf_file.read()
-            pedidos = extraer_pedidos_agrupados(pdf_bytes)
-            excel_procesado, alertas = rellenar_excel_dinamico(excel_file.read(), pedidos)
-
-            st.success(f"✨ ¡Conseguido! Se han estructurado {len(pedidos)} alumnos en tu Excel.")
-
-            if alertas:
-              with st.expander("⚠️ Alertas de verificación manual:", expanded=True):
-                for al in alertas: 
-                    st.info(al)
-
-            filename_clean = f"Pedidos_{nombre_colegio}_{fecha_pedido.strftime('%d%m_%Y')}.xlsx"
+    with st.spinner("Buscando contornos de celdas y mapeando datos..."):
+      try:
+        pdf_bytes = pdf_file.read()
+        pedidos = extraer_pedidos_agrupados(pdf_bytes)
+        excel_procesado, alertas = rellenar_excel_dinamico(excel_file.read(), pedidos)
+        st.success(f"✨ ¡Conseguido! Se han estructurado {len(pedidos)} alumnos en tu Excel.")
+        if alertas:
+            with st.expander("⚠️ Alertas de verificación manual:", expanded=True):
+            for al in alertas: st.info(al)
+            filename_clean = f"Pedidos_{nombre_colegio}{fecha_pedido.strftime('%d%m%Y')}.xlsx"
             st.download_button(
                 label="📥 Descargar Libro de Excel Consolidado",
                 data=excel_procesado,
@@ -275,5 +275,6 @@ if st.button("🚀 Ejecutar Consolidación de Pedidos", type="primary", use_cont
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
-        except Exception as e:
-            st.error(f"Se ha producido un error durante el volcado de datos: {str(e)}")
+      except Exception as e:
+        st.error(f"Se ha producido un error durante el volcado de datos: {str(e)}")
+
