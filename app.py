@@ -266,8 +266,8 @@ if st.button("🚀 Ejecutar Consolidación de Pedidos", type="primary", use_cont
         st.success(f"✨ ¡Conseguido! Se han estructurado {len(pedidos)} alumnos en tu Excel.")
         if alertas:
             with st.expander("⚠️ Alertas de verificación manual:", expanded=True):
-            for al in alertas: 
-                st.info(al)
+                for al in alertas: 
+                    st.info(al)
             filename_clean = f"Pedidos_{nombre_colegio}{fecha_pedido.strftime('%d%m%Y')}.xlsx"
             st.download_button(
                 label="📥 Descargar Libro de Excel Consolidado",
