@@ -29,17 +29,14 @@ def extraer_datos_pdf(pdf_bytes):
         match_nombre = re.search(r"NOMBRE Y APELLIDOS:\s*(.*?)(?=\s*TELÉFONO|\s*CURSO|\n|$)", texto, re.IGNORECASE)
         nombre = match_nombre.group(1).strip() if match_nombre else ""
         
-        # Si el nombre está partido en dos líneas, intentamos rescatar la segunda línea si existe
         if not nombre or len(nombre) < 3:
             lineas_texto = texto.split("\n")
             for l_idx, linea in enumerate(lineas_texto):
                 if "NOMBRE Y APELLIDOS" in linea.upper():
-                    # Unir con la siguiente línea por si está partido
                     if l_idx + 1 < len(lineas_texto):
                         nombre = linea.split(":")[-1].strip() + " " + lineas_texto[l_idx + 1].strip()
                     break
 
-        # Limpiar caracteres raros del nombre
         nombre = re.sub(r"TELÉFONO.*", "", nombre, flags=re.IGNORECASE).strip()
         
         # 2. Extraer Teléfono y Curso
@@ -49,31 +46,37 @@ def extraer_datos_pdf(pdf_bytes):
         match_curso = re.search(r"CURSO/CENTRO:\s*(.*?)(?=\s*FECHA|\n|$)", texto, re.IGNORECASE)
         curso = match_curso.group(1).strip() if match_curso else ""
         
-        # 3. Extracción tabulada estricta de referencias (C001 a C999) hasta "TOTAL ARTÍCULOS"
+        # 3. Extracción tabulada estricta de referencias hasta "TOTAL ARTÍCULOS"
         cantidades = {}
         lineas = texto.split("\n")
         leyendo_tabla = True
         
         for linea in lineas:
-            # Si llegamos al final del bloque de artículos, paramos de leer este alumno
             if "TOTAL" in linea.upper() and "ARTÍCULO" in linea.upper():
                 leyendo_tabla = False
                 break
                 
             if leyendo_tabla:
-                # Buscar código de referencia exacto (ej: C001, C019...)
                 match_ref = re.search(r"\b(C\d{3})\b", linea)
                 if match_ref:
                     ref_code = match_ref.group(1)
-                    # Extraer números en la línea
+                    
+                    # FILTRO INTELIGENTE: Ignorar números que sean gramos (300g, 1800g, etc.) o la referencia
+                    # Buscamos números en la línea que sean candidatos lógicos de cantidad (ej: entre 1 y 50)
                     numeros = re.findall(r"\b\d+\b", linea)
-                    if numeros:
-                        # Filtrar para no coger el propio código ni números de la columna de orden (1 al 30)
-                        # Buscamos el número que está aislado al final (la cantidad escrita a mano)
-                        candidatos = [int(n) for n in numeros if int(n) != int(ref_code[1:])]
-                        if candidatos:
-                            qty = candidatos[-1] # La cantidad suele ser el último número de la línea
-                            cantidades[ref_code] = qty
+                    candidatos = []
+                    for n in numeros:
+                        val = int(n)
+                        # Descartar el número de referencia y números grandes (que son gramos o precios)
+                        if val != int(ref_code[1:]) and val <= 50:
+                            # Asegurarnos de que no van acompañados de 'g' o 'gr' inmediatamente
+                            patron_gramos = rf"{val}\s*(?:g|gr|kg)"
+                            if not re.search(patron_gramos, linea, re.IGNORECASE):
+                                candidatos.append(val)
+                    
+                    if candidatos:
+                        # La cantidad real suele ser el último número válido de la línea
+                        cantidades[ref_code] = candidatos[-1]
 
         pedidos.append({
             "pagina": idx + 1,
@@ -88,40 +91,70 @@ def extraer_datos_pdf(pdf_bytes):
 
 def rellenar_excel_dinamico(excel_bytes, pedidos):
     """
-    Rellena la plantilla Excel cruzando las referencias de forma exacta 
-    y marcando en amarillo si detecta cantidades anómalas o datos vacíos.
+    Rellena la plantilla Excel buscando dinámicamente dónde van los datos 
+    y duplicando pestañas si hay más alumnos que hojas en la plantilla original.
     """
     wb = openpyxl.load_workbook(io.BytesIO(excel_bytes))
     hojas_disponibles = wb.sheetnames
     
-    # Excluir pestañas de resumen o instrucciones
-    hojas_alumnos = [h for h in hojas_disponibles if h.upper() not in ["RESUMEN", "INSTRUCCIONES", "DATOS", "TARIFA"]]
+    # Identificar hojas de alumnos (excluyendo RESUMEN, etc.)
+    hojas_alumnos_base = [h for h in hojas_disponibles if h.upper() not in ["RESUMEN", "INSTRUCCIONES", "DATOS", "TARIFA"]]
+    
+    if not hojas_alumnos_base:
+        raise ValueError("No se ha encontrado ninguna pestaña de alumno válida en el Excel.")
+        
+     hoja_plantilla_nombre = hojas_alumnos_base[0]
+    ws_plantilla = wb[hoja_plantilla_nombre]
     
     alertas = []
 
     for i, pedido in enumerate(pedidos):
-        if i >= len(hojas_alumnos):
-            alertas.append(f"⚠️ Hay más páginas en el PDF que pestañas de alumnos en el Excel ({len(pedidos)} vs {len(hojas_alumnos)}).")
-            break
-            
-        ws = wb[hojas_alumnos[i]]
-        
-        # --- VOLCADO DE CABECERA ---
-        celda_nombre = ws["B3"]
-        if "ALUMNO_PAG" in pedido["nombre"]:
-            celda_nombre.value = "¡REVISAR NOMBRE!"
-            celda_nombre.fill = YELLOW_FILL
-            alertas.append(f"Página {pedido['pagina']}: Nombre no detectado. Revisar pestaña '{ws.title}'.")
+        # Si hay más alumnos en el PDF que pestañas en el Excel, duplicamos la plantilla
+        if i < len(hojas_alumnos_base):
+            ws = wb[hojas_alumnos_base[i]]
         else:
-            celda_nombre.value = pedido["nombre"]
-            
-        if pedido["telefono"]:
-            ws["B4"] = pedido["telefono"]
-        if pedido["curso"]:
-            ws["B5"] = pedido["curso"]
-            
-        # --- MAPEAR LA TABLA DE LA PLANTILLA EXCEL ---
-        # Buscamos exactamente dónde están las celdas de las referencias (C001, C002...) en esta hoja
+            # Duplicar hoja plantilla para el nuevo alumno
+            ws = wb.copy_worksheet(ws_plantilla)
+            nombre_nueva_hoja = f"Alumno_{i+1}"
+            ws.title = nombre_nueva_hoja
+
+        # --- BÚSQUEDA DINÁMICA DE CABECERA EN EL EXCEL ---
+        # Buscamos dónde pone "NOMBRE" o "NOMBRE DEL ALUMNO" para colocar el nombre al lado
+        celda_nombre_encontrada = False
+        celda_telefono_encontrada = False
+        
+        for row in range(1, 15): # Buscar en las primeras 15 filas
+            for col in range(1, 10):
+                val = str(ws.cell(row=row, column=col).value or "").upper()
+                
+                # Buscar celda del nombre
+                if "NOMBRE" in val and not celda_nombre_encontrada:
+                    celda_val = ws.cell(row=row, column=col + 1) # Celda a la derecha
+                    if "ALUMNO" in val or ws.cell(row=row, column=col).value == "NOMBRE DEL ALUMNO:":
+                        # A veces está debajo o a la derecha, probamos a la derecha o en col+2
+                        celda_destino = ws.cell(row=row, column=col + 1)
+                    else:
+                        celda_destino = ws.cell(row=row, column=col + 1)
+                    
+                    if "ALUMNO_PAG" in pedido["nombre"]:
+                        celda_destino.value = "¡REVISAR NOMBRE!"
+                        celda_destino.fill = YELLOW_FILL
+                        alertas.append(f"Página {pedido['pagina']}: Nombre no detectado.")
+                    else:
+                        celda_destino.value = pedido["nombre"]
+                    celda_nombre_encontrada = True
+
+                # Buscar celda del teléfono
+                if "TELÉFONO" in val or "TELEFONO" in val:
+                    if pedido["telefono"]:
+                        ws.cell(row=row, column=col + 1, value=pedido["telefono"])
+                    celda_telefono_encontrada = True
+
+        # Fallback por si la etiqueta no se encuentra exactamente
+        if not celda_nombre_encontrada:
+            ws["B10"] = pedido["nombre"] if "ALUMNO_PAG" not in pedido["nombre"] else "¡REVISAR NOMBRE!"
+
+        # --- MAPEAR LA TABLA DE REFERENCIAS EN EL EXCEL ---
         mapa_celdas_ref = {}
         for row in range(1, ws.max_row + 1):
             for col in range(1, 10):
@@ -129,9 +162,8 @@ def rellenar_excel_dinamico(excel_bytes, pedidos):
                 match_c = re.search(r"\b(C\d{3})\b", val)
                 if match_c:
                     ref_code = match_c.group(1)
-                    # Asumimos que la cantidad se pone en la columna situada a la derecha de la referencia o descripción
-                    # Buscamos celdas vacías o numéricas en las columnas contiguas (ej: col+3 o col+4)
-                    mapa_celdas_ref[ref_code] = (row, col + 3) # Ajusta este desplazamiento si difiere en tu plantilla
+                    # La cantidad suele estar unas columnas a la derecha de la referencia
+                    mapa_celdas_ref[ref_code] = (row, col + 3)
 
         # --- VOLCADO Y VALIDACIÓN DE CANTIDADES ---
         for ref_code, cantidad in pedido["cantidades"].items():
@@ -139,15 +171,13 @@ def rellenar_excel_dinamico(excel_bytes, pedidos):
                 r, c = mapa_celdas_ref[ref_code]
                 celda_destino = ws.cell(row=r, column=c)
                 
-                # VALIDACIÓN DE ANOMALÍAS: Si la cantidad es exagerada (ej > 50), se marca en amarillo
                 if cantidad > 50:
                     celda_destino.value = cantidad
                     celda_destino.fill = YELLOW_FILL
-                    alertas.append(f"Página {pedido['pagina']} ({pedido['nombre']}): Cantidad anómala ({cantidad}) en referencia {ref_code}. Marcado en amarillo.")
+                    alertas.append(f"Página {pedido['pagina']} ({pedido['nombre']}): Cantidad anómala ({cantidad}) en {ref_code}.")
                 else:
                     celda_destino.value = cantidad
 
-    # Guardar cambios
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
@@ -155,8 +185,8 @@ def rellenar_excel_dinamico(excel_bytes, pedidos):
 
 
 # --- INTERFAZ GRÁFICA STREAMLIT ---
-st.title("🍬 Procesador de Pedidos de Confitura (Versión Optimizada)")
-st.markdown("Extracción inteligente delimitada por 'TOTAL ARTÍCULOS' y validación de referencias.")
+st.title("🍬 Procesador de Pedidos de Confitura")
+st.markdown("Extracción inteligente con búsqueda dinámica de campos y filtro de pesos.")
 
 st.sidebar.header("Configuración")
 nombre_colegio = st.sidebar.text_input("Nombre del Colegio / Centro", placeholder="Ej: IES_Lopez_de_Arenas")
@@ -174,21 +204,21 @@ with col2:
 
 st.divider()
 
-if st.button("🚀 Procesar con Precisión", type="primary", use_container_width=True):
+if st.button("🚀 Procesar con Precisión Quirúrgica", type="primary", use_container_width=True):
     if not nombre_colegio:
         st.error("❌ Introduce el nombre del colegio.")
     elif not pdf_file or not excel_file:
         st.error("❌ Sube ambos archivos.")
     else:
-        with st.spinner("Analizando bloques y frenando en 'TOTAL ARTÍCULOS'..."):
+        with st.spinner("Analizando páginas, filtrando gramos y rellenando pestañas..."):
             try:
                 pedidos = extraer_datos_pdf(pdf_file.read())
                 excel_procesado, alertas = rellenar_excel_dinamico(excel_file.read(), pedidos)
                 
-                st.success(f"✅ ¡Lectura finalizada! Se han procesado {len(pedidos)} fichas.")
+                st.success(f"✅ ¡Lectura finalizada! Se han procesado {len(pedidos)} fichas de alumnos.")
                 
                 if alertas:
-                    with st.expander("⚠️ Alertas de revisión (Celdas marcadas en amarillo):", expanded=True):
+                    with st.expander("⚠️ Alertas de revisión:", expanded=True):
                         for al in alertas:
                             st.warning(al)
                 
