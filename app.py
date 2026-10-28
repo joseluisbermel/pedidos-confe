@@ -8,208 +8,172 @@ from PIL import Image
 import pdf2image
 
 st.set_page_config(
-    page_title="Gestor de Pedidos Escolares",
+    page_title="Gestor de Pedidos Escolares (Imágenes y PDFs)",
     page_icon="🍬",
     layout="wide"
 )
 
-# Estilo de alerta en amarillo chillón para celdas dudosas o anomalías
 YELLOW_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
-def extraer_texto_pagina(page, pdf_bytes, page_idx):
+def extraer_texto_de_imagen(img):
     """
-    Intenta extraer texto de forma digital. Si está vacío (es una imagen escaneada),
-    aplica OCR localmente mediante pytesseract y pdf2image.
+    Utiliza pytesseract OCR para extraer todo el texto visible de una imagen 
+    (ya sea una página de PDF escaneada o una foto suelta).
     """
-    texto = page.extract_text() or ""
-    if len(texto.strip()) > 15:
-        return texto
-    
-    # Fallback a OCR si la página es una imagen escaneada
     try:
         import pytesseract
-        images = pdf2image.convert_from_bytes(pdf_bytes, first_page=page_idx+1, last_page=page_idx+1)
-        if images:
-            texto_ocr = pytesseract.image_to_string(images[0], lang='spa')
-            return texto_ocr
+        # Configuramos tesseract en español
+        texto = pytesseract.image_to_string(img, lang='spa')
+        return texto
     except Exception as e:
-        print(f"Error en OCR para página {page_idx+1}: {e}")
-        
-    return texto
+        st.error(f"Error al procesar OCR en imagen: {e}")
+        return ""
 
-
-def extraer_pedidos_agrupados(pdf_bytes):
+def procesar_contenido_imagen(img, origen_nombre=""):
     """
-    Agrupa las páginas del PDF por alumno de forma inteligente.
-    Una ficha puede ocupar 1 o 2 páginas y finaliza al encontrar 'TOTAL ARTÍCULOS'.
+    Analiza el texto extraído por OCR de una hoja de pedido (foto o PDF escaneado)
+    y devuelve un diccionario estructurado con el alumno, teléfono, curso y cantidades.
     """
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    pedidos = []
+    texto = extraer_texto_de_imagen(img)
+    lineas = [l.strip() for l in texto.split("\n") if l.strip()]
     
-    alumno_actual = None
+    nombre = ""
+    telefono = ""
+    curso = ""
     
-    for idx, page in enumerate(reader.pages):
-        texto = extraer_texto_pagina(page, pdf_bytes, idx)
-        lineas = [l.strip() for l in texto.split("\n") if l.strip()]
-        
-        # Si no hay un alumno activo, buscamos los datos de cabecera en esta página
-        if alumno_actual is None:
-            nombre = ""
-            telefono = ""
-            curso = ""
+    # 1. Búsqueda de Nombre y Apellidos
+    for l_idx, linea in enumerate(lineas):
+        if "NOMBRE" in linea.upper() or "APELLIDOS" in linea.upper():
+            if ":" in linea:
+                nombre = linea.split(":")[-1].strip()
+            if not nombre and l_idx + 1 < len(lineas):
+                nombre = lineas[l_idx + 1].strip()
+            break
             
-            # Buscar nombre
-            for l_idx, linea in enumerate(lineas):
-                if "NOMBRE" in linea.upper() or "APELLIDOS" in linea.upper():
-                    if ":" in linea:
-                        nombre = linea.split(":")[-1].strip()
-                    if not nombre and l_idx + 1 < len(lineas):
-                        nombre = lineas[l_idx + 1].strip()
-                    break
-            
-            # Si no se encontró por etiqueta, buscamos patrones habituales
-            if not nombre or len(nombre) < 3:
-                for linea in lineas:
-                    if len(linea) > 5 and not "EMORENO" in linea.upper() and not "PEDIDOS" in linea.upper() and not "ESCOLAR" in linea.upper():
-                        # Podría ser el nombre si va en mayúsculas
-                        if linea == linea.upper() and " " in linea:
-                            nombre = linea
-                            break
-
-            nombre = re.sub(r"TELÉFONO.*", "", nombre, flags=re.IGNORECASE).strip()
-            nombre = re.sub(r"CURSO.*", "", nombre, flags=re.IGNORECASE).strip()
-
-            # Buscar teléfono
-            for linea in lineas:
-                match_tel = re.search(r"(?:TELÉFONO|TELEFONO|TELF)[:\s]*([\d\s]{6,15})", linea, re.IGNORECASE)
-                if match_tel:
-                    telefono = match_tel.group(1).strip()
-                    break
-
-            # Buscar curso / centro
-            for linea in lineas:
-                match_cur = re.search(r"(?:CURSO/CENTRO|CURSO|CENTRO)[:\s]*(.*)", linea, re.IGNORECASE)
-                if match_cur:
-                    curso = match_cur.group(1).strip()
-                    break
-
-            alumno_actual = {
-                "nombre": nombre if nombre else f"ALUMNO_PAG_{idx + 1}",
-                "telefono": telefono,
-                "curso": curso,
-                "cantidades": {},
-                "paginas": [idx + 1]
-            }
-        else:
-            alumno_actual["paginas"].append(idx + 1)
-
-        # Extracción de referencias (C001 a C030) y cantidades
-        leyendo_tabla = True
+    if not nombre or len(nombre) < 3:
         for linea in lineas:
-            if "TOTAL" in linea.upper() and "ARTÍCULO" in linea.upper():
-                leyendo_tabla = False
+            if linea == linea.upper() and len(linea) > 6 and not "EMORENO" in linea.upper() and not "PEDIDOS" in linea.upper() and not "PROMOCIÓN" in linea.upper():
+                nombre = linea
                 break
-                
-            if leyendo_tabla:
-                match_ref = re.search(r"\b(C\d{3})\b", linea)
-                if match_ref:
-                    ref_code = match_ref.group(1)
-                    numeros = re.findall(r"\b\d+\b", linea)
-                    candidatos = []
-                    for n in numeros:
-                        val = int(n)
-                        # Descartar número de referencia y gramos (300g, 1800g, etc.)
-                        if val != int(ref_code[1:]) and val <= 50:
-                            if not re.search(rf"{val}\s*(?:g|gr|kg)", linea, re.IGNORECASE):
-                                candidatos.append(val)
-                    if candidatos:
-                        alumno_actual["cantidades"][ref_code] = candidatos[-1]
 
-        # Comprobar si esta página contiene el cierre del pedido ("TOTAL ARTÍCULOS")
-        es_fin_pedido = any("TOTAL" in l.upper() and "ARTÍCULO" in l.upper() for l in lineas)
-        if es_fin_pedido:
-            pedidos.append(alumno_actual)
-            alumno_actual = None
+    nombre = re.sub(r"TELÉFONO.*", "", nombre, flags=re.IGNORECASE).strip()
+    nombre = re.sub(r"CURSO.*", "", nombre, flags=re.IGNORECASE).strip()
+    nombre = re.sub(r"FECHA.*", "", nombre, flags=re.IGNORECASE).strip()
 
-    # Si queda un alumno pendiente sin cierre explícito, se guarda
-    if alumno_actual is not None:
-        pedidos.append(alumno_actual)
+    # 2. Búsqueda de Teléfono
+    for linea in lineas:
+        match_tel = re.search(r"(?:TELÉFONO|TELEFONO|TELF|TELF\.)[:\s]*([\d\s]{6,15})", linea, re.IGNORECASE)
+        if match_tel:
+            telefono = match_tel.group(1).strip()
+            break
+
+    # 3. Búsqueda de Curso / Centro
+    for linea in lineas:
+        match_cur = re.search(r"(?:CURSO/CENTRO|CURSO|CENTRO)[:\s]*(.*)", linea, re.IGNORECASE)
+        if match_cur:
+            curso = match_cur.group(1).strip()
+            break
+
+    # 4. Extracción de Referencias (C001 - C030) y sus cantidades
+    cantidades = {}
+    leyendo_tabla = True
+    for linea in lineas:
+        if "TOTAL" in linea.upper() and ("ARTÍCULO" in linea.upper() or "ARTICULO" in linea.upper()):
+            leyendo_tabla = False
+            
+        # Buscar código de artículo C001 hasta C030 o número de artículo suelto
+        match_ref = re.search(r"\b(C?\d{1,2})\b", linea)
+        # También buscamos explícitamente C001-C030
+        match_c_ref = re.search(r"\b(C\d{3})\b", linea)
         
-    return pedidos
+        ref_code = None
+        if match_c_ref:
+            ref_code = match_c_ref.group(1)
+        else:
+            # Si viene como número simple en la tabla (1 al 30)
+            match_num_ref = re.search(r"\b([1-2]?[0-9]|30)\b", linea)
+            if match_num_ref and ("HOJALDRADA" in linea.upper() or "BOMBON" in linea.upper() or "SURTIDO" in linea.upper() or "MANTECADO" in linea.upper() or "BARQUILLO" in linea.upper() or "BOLITAS" in linea.upper() or "CHOCO" in linea.upper() or "ALMENDRAS" in linea.upper() or "ROSCOS" in linea.upper() or "YEMITAS" in linea.upper() or "DELICIAS" in linea.upper()):
+                num_val = int(match_num_ref.group(1))
+                if 1 <= num_val <= 30:
+                    ref_code = f"C{num_val:03d}"
+
+        if ref_code:
+            # Buscar números en la misma línea que representen cantidades (1 a 50, descartando gramos como 300g, 1800g)
+            numeros = re.findall(r"\b\d+\b", linea)
+            candidatos = []
+            for n in numeros:
+                val = int(n)
+                # Descartar el número de referencia y valores de gramos/precios
+                if val != int(ref_code[1:]) and val <= 50:
+                    if not re.search(rf"{val}\s*(?:g|gr|kg|€)", linea, re.IGNORECASE):
+                        candidatos.append(val)
+            if candidatos:
+                cantidades[ref_code] = candidatos[-1]
+
+    return {
+        "nombre": nombre if nombre else f"Alumno_{origen_nombre}",
+        "telefono": telefono,
+        "curso": curso,
+        "cantidades": cantidades
+    }
 
 
-def rellenar_excel_dinamico(excel_bytes, pedidos):
-    """
-    Rellena la plantilla Excel con los pedidos agrupados, duplicando pestañas 
-    automáticamente si hay más alumnos que hojas en la plantilla original.
-    """
+def rellenar_excel(excel_bytes, pedidos):
     wb = openpyxl.load_workbook(io.BytesIO(excel_bytes))
     hojas_disponibles = wb.sheetnames
     
-    # Excluir pestañas de sistema o resumen
     hojas_alumnos_base = [h for h in hojas_disponibles if h.upper() not in ["RESUMEN", "INSTRUCCIONES", "DATOS", "TARIFA"]]
     
     if not hojas_alumnos_base:
-        raise ValueError("No se ha encontrado ninguna pestaña de alumno válida en el Excel.")
+        raise ValueError("No se encontró ninguna pestaña de alumno en el Excel.")
         
-    hoja_plantilla_nombre = hojas_alumnos_base[0]
-    ws_plantilla = wb[hoja_plantilla_nombre]
-    
+    ws_plantilla = wb[hojas_alumnos_base[0]]
     alertas = []
 
     for i, pedido in enumerate(pedidos):
-        # Asignar o duplicar pestaña para el alumno actual
         if i < len(hojas_alumnos_base):
             ws = wb[hojas_alumnos_base[i]]
         else:
             ws = wb.copy_worksheet(ws_plantilla)
             ws.title = f"Alumno_{i+1}"
 
-        # --- VOLCADO DINÁMICO DE CABECERA ---
-        celda_nombre_encontrada = False
+        # Volcar cabecera
+        encontrado_nombre = False
         for row in range(1, 15):
             for col in range(1, 10):
                 val = str(ws.cell(row=row, column=col).value or "").upper()
-                
-                if "NOMBRE" in val and not celda_nombre_encontrada:
-                    celda_destino = ws.cell(row=row, column=col + 1)
-                    if "ALUMNO_PAG" in pedido["nombre"] or not pedido["nombre"]:
-                        celda_destino.value = "¡REVISAR NOMBRE!"
-                        celda_destino.fill = YELLOW_FILL
-                        alertas.append(f"Páginas {pedido['paginas']}: Nombre no detectado.")
+                if "NOMBRE" in val and not encontrado_nombre:
+                    celda_dest = ws.cell(row=row, column=col + 1)
+                    if "ALUMNO_" in pedido["nombre"] or not pedido["nombre"]:
+                        celda_dest.value = "¡REVISAR NOMBRE!"
+                        celda_dest.fill = YELLOW_FILL
+                        alertas.append(f"Pedido {i+1}: Nombre no detectado.")
                     else:
-                        celda_destino.value = pedido["nombre"]
-                    celda_nombre_encontrada = True
+                        celda_dest.value = pedido["nombre"]
+                    encontrado_nombre = True
 
                 if "TELÉFONO" in val or "TELEFONO" in val:
                     if pedido["telefono"]:
                         ws.cell(row=row, column=col + 1, value=pedido["telefono"])
 
-        if not celda_nombre_encontrada:
-            ws["B10"] = pedido["nombre"] if "ALUMNO_PAG" not in pedido["nombre"] else "¡REVISAR NOMBRE!"
+        if not encontrado_nombre:
+            ws["B10"] = pedido["nombre"]
 
-        # --- MAPEAR LA TABLA DE REFERENCIAS EN EL EXCEL ---
-        mapa_celdas_ref = {}
+        # Mapear referencias en la hoja Excel
+        mapa_refs = {}
         for row in range(1, ws.max_row + 1):
             for col in range(1, 10):
                 val = str(ws.cell(row=row, column=col).value or "").strip()
                 match_c = re.search(r"\b(C\d{3})\b", val)
                 if match_c:
-                    ref_code = match_c.group(1)
-                    mapa_celdas_ref[ref_code] = (row, col + 3)
+                    mapa_refs[match_c.group(1)] = (row, col + 3)
 
-        # --- VOLCADO Y VALIDACIÓN DE CANTIDADES ---
+        # Volcar cantidades
         for ref_code, cantidad in pedido["cantidades"].items():
-            if ref_code in mapa_celdas_ref:
-                r, c = mapa_celdas_ref[ref_code]
-                celda_destino = ws.cell(row=r, column=c)
-                
-                if cantidad > 50:
-                    celda_destino.value = cantidad
-                    celda_destino.fill = YELLOW_FILL
-                    alertas.append(f"Alumno {pedido['nombre']} (Págs {pedido['paginas']}): Cantidad anómala ({cantidad}) en {ref_code}.")
-                else:
-                    celda_destino.value = cantidad
+            if ref_code in mapa_refs:
+                r, c = mapa_refs[ref_code]
+                celda_dest = ws.cell(row=r, column=c)
+                celda_dest.value = cantidad
 
     output = io.BytesIO()
     wb.save(output)
@@ -217,55 +181,56 @@ def rellenar_excel_dinamico(excel_bytes, pedidos):
     return output.getvalue(), alertas
 
 
-# --- INTERFAZ GRÁFICA STREAMLIT ---
-st.title("🍬 Procesador de Pedidos de Confitura")
-st.markdown("Agrupación inteligente multi-página y soporte OCR para hojas escritas a mano.")
-
-st.sidebar.header("Configuración")
-nombre_colegio = st.sidebar.text_input("Nombre del Colegio / Centro", placeholder="Ej: IES_Lopez_de_Arenas")
-fecha_pedido = st.sidebar.date_input("Fecha del Pedido")
-
-st.divider()
+# Interfaz Streamlit
+st.title("🍬 Procesador Universal de Pedidos (PDFs e Imágenes)")
+st.markdown("Sube tanto archivos PDF (con páginas escaneadas) como fotos sueltas de los pedidos en formato imagen.")
 
 col1, col2 = st.columns(2)
 with col1:
-    st.subheader("1. PDF de Pedidos")
-    pdf_file = st.file_uploader("Sube el PDF", type=["pdf"])
+    archivos_pdf = st.file_uploader("Sube PDF(s) de Pedidos", type=["pdf"], accept_multiple_files=True)
+    archivos_img = st.file_uploader("O sube Fotos sueltas de Pedidos", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 with col2:
-    st.subheader("2. Plantilla Excel")
-    excel_file = st.file_uploader("Sube la plantilla Excel (.xlsx)", type=["xlsx"])
+    excel_file = st.file_uploader("Sube la Plantilla Excel (.xlsx)", type=["xlsx"])
 
-st.divider()
-
-if st.button("🚀 Procesar Pedidos al Completo", type="primary", use_container_width=True):
-    if not nombre_colegio:
-        st.error("❌ Introduce el nombre del colegio.")
-    elif not pdf_file or not excel_file:
-        st.error("❌ Sube ambos archivos.")
+if st.button("🚀 Procesar Todos los Pedidos", type="primary", use_container_width=True):
+    if not (archivos_pdf or archivos_img) or not excel_file:
+        st.error("❌ Sube al menos un archivo de pedidos (PDF o imágenes) y la plantilla Excel.")
     else:
-        with st.spinner("Agrupando páginas, aplicando OCR y volcando en el Excel..."):
+        with st.spinner("Analizando imágenes y extrayendo datos con OCR..."):
             try:
-                pdf_bytes = pdf_file.read()
-                pedidos = extraer_pedidos_agrupados(pdf_bytes)
-                excel_procesado, alertas = rellenar_excel_dinamico(excel_file.read(), pedidos)
+                pedidos_totales = []
                 
-                st.success(f"✅ ¡Proceso completado! Se han consolidado {len(pedidos)} fichas de alumnos.")
+                # 1. Procesar PDFs convirtiéndolos a imágenes y aplicando OCR
+                if archivos_pdf:
+                    for pdf in archivos_pdf:
+                        pdf_bytes = pdf.read()
+                        images = pdf2image.convert_from_bytes(pdf_bytes)
+                        for img_idx, img in enumerate(images):
+                            datos_pedido = procesar_contenido_imagen(img, f"PDF_{pdf.name}_pag_{img_idx+1}")
+                            pedidos_totales.append(datos_pedido)
+                
+                # 2. Procesar imágenes sueltas subidas directamente
+                if archivos_img:
+                    for img_file in archivos_img:
+                        img = Image.open(img_file)
+                        datos_pedido = procesar_contenido_imagen(img, img_file.name)
+                        pedidos_totales.append(datos_pedido)
+                
+                excel_final, alertas = rellenar_excel(excel_file.read(), pedidos_totales)
+                
+                st.success(f"✅ ¡Proceso completado con éxito! Se han procesado {len(pedidos_totales)} pedidos en total.")
                 
                 if alertas:
                     with st.expander("⚠️ Alertas de revisión:", expanded=True):
                         for al in alertas:
                             st.warning(al)
                 
-                colegio_clean = re.sub(r"[^\w\s-]", "", nombre_colegio).strip().replace(" ", "_")
-                fecha_str = fecha_pedido.strftime("%d-%m-%Y")
-                nombre_archivo_final = f"{colegio_clean}_{fecha_str}.xlsx"
-                
                 st.download_button(
-                    label=f"📥 Descargar {nombre_archivo_final}",
-                    data=excel_procesado,
-                    file_name=nombre_archivo_final,
+                    label="📥 Descargar Excel Consolidado",
+                    data=excel_final,
+                    file_name="pedidos_consolidados_universal.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
             except Exception as e:
-                st.error(f"Error crítico en el proceso: {str(e)}")
+                st.error(f"Error crítico en el procesamiento: {str(e)}")
