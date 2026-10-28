@@ -103,7 +103,7 @@ def rellenar_excel_dinamico(excel_bytes, pedidos):
     if not hojas_alumnos_base:
         raise ValueError("No se ha encontrado ninguna pestaña de alumno válida en el Excel.")
         
-     hoja_plantilla_nombre = hojas_alumnos_base[0]
+    hoja_plantilla_nombre = hojas_alumnos_base[0]
     ws_plantilla = wb[hoja_plantilla_nombre]
     
     alertas = []
