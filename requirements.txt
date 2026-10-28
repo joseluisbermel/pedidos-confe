@@ -1,6 +1,6 @@
 streamlit
 pypdf
 openpyxl
-Pillow
-pytesseract
 pdf2image
+pillow
+pytesseract
